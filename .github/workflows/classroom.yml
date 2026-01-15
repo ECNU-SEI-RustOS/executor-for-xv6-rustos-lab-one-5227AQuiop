@@ -30,3 +30,5 @@ jobs:
 
       - name: Run grading
         run: make grade
+      - name: 强制添加grade-lab可执行权限
+        run: chmod +x grade-lab
