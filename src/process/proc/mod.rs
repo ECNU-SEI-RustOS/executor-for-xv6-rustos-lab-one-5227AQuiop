@@ -102,6 +102,8 @@ pub struct ProcData {
     pub pagetable: Option<Box<PageTable>>,
     /// 进程当前工作目录的 inode。
     pub cwd: Option<Inode>,
+    /// 新增：trace系统调用的掩码，0表示不追踪任何系统调用
+    pub trace_mask: u64,
 }
 
 
@@ -115,6 +117,7 @@ impl ProcData {
             open_files: array![_ => None; NFILE],
             tf: ptr::null_mut(),
             pagetable: None,
+            trace_mask: 0,  // 初始化掩码为0，不追踪任何系统调用
             cwd: None,
         }
     }
@@ -283,6 +286,8 @@ impl ProcData {
             pgt.dealloc_proc_pagetable(self.sz);
         }
         self.sz = 0;
+        // 新增：清理trace_mask
+        self.trace_mask = 0;
     }
 
     /// # 功能说明
@@ -465,6 +470,33 @@ impl Proc {
         unsafe { PROC_MANAGER.exiting(self.index, exit_status); }
     }
 
+    /// 新增：系统调用名称数组，与syscall.h中的编号一一对应
+    const SYSCALL_NAMES: &'static [&'static str] = &[
+        "unused",    // 0: 未使用
+        "fork",      // 1: SYS_fork
+        "exit",      // 2: SYS_exit
+        "wait",      // 3: SYS_wait
+        "pipe",      // 4: SYS_pipe
+        "read",      // 5: SYS_read
+        "kill",      // 6: SYS_kill
+        "exec",      // 7: SYS_exec
+        "fstat",     // 8: SYS_fstat
+        "chdir",     // 9: SYS_chdir
+        "dup",       // 10: SYS_dup
+        "getpid",    // 11: SYS_getpid
+        "sbrk",      // 12: SYS_sbrk
+        "sleep",     // 13: SYS_sleep
+        "uptime",    // 14: SYS_uptime
+        "open",      // 15: SYS_open
+        "write",     // 16: SYS_write
+        "mknod",     // 17: SYS_mknod
+        "unlink",    // 18: SYS_unlink
+        "link",      // 19: SYS_link
+        "mkdir",     // 20: SYS_mkdir
+        "close",     // 21: SYS_close
+        "trace",     // 22: SYS_trace（需与syscall.h中的编号一致）
+    ];
+
     /// # 功能说明
     /// 处理当前进程发起的系统调用请求。根据 TrapFrame 中寄存器 a7 指定的系统调用号，
     /// 调用对应的系统调用处理函数，并将返回结果写回寄存器 a0。
@@ -477,6 +509,7 @@ impl Proc {
     /// 5. 若系统调用号非法，调用 `panic!` 抛出异常，终止内核执行。
     /// 6. 将系统调用执行结果写入 TrapFrame 的返回寄存器 `a0`，
     ///    成功返回实际结果，失败返回 -1（以 `usize` 格式存储）。
+    /// 7. 新增：检查trace_mask，若需要则打印追踪信息
     ///
     /// # 参数
     /// - `&mut self`：当前进程的可变引用，用于访问其 TrapFrame 和调用系统调用实现。
@@ -520,6 +553,7 @@ impl Proc {
             19 => self.sys_link(),
             20 => self.sys_mkdir(),
             21 => self.sys_close(),
+            22 => self.sys_trace(),  // 新增：分发trace系统调用
             _ => {
                 panic!("unknown syscall num: {}", a7);
             }
@@ -528,6 +562,39 @@ impl Proc {
             Ok(ret) => ret,
             Err(()) => -1isize as usize,
         };
+
+        // 新增：系统调用返回前，检查是否需要打印追踪信息
+        let pd = self.data.get_mut();
+        // 1. 检查trace_mask是否包含当前系统调用的位
+        if (pd.trace_mask & (1 << a7)) != 0 {
+            // 2. 获取进程PID（需要加锁获取excl中的pid）
+            let excl_guard = self.excl.lock();
+            let pid = excl_guard.pid;
+            drop(excl_guard);
+            // 3. 获取系统调用名称（越界则显示unknown）
+            let name = Self::SYSCALL_NAMES.get(a7 as usize)
+                .unwrap_or(&"unknown");
+            // 4. 获取返回值（区分成功/失败）
+            let ret_val = if sys_result.is_ok() {
+                sys_result.unwrap() as isize
+            } else {
+                -1isize
+            };
+            // 5. 打印追踪信息，格式：PID: syscall 名称 -> 返回值
+            println!("{}: syscall {} -> {}", pid, name, ret_val);
+        }
+    }
+
+    /// 新增：实现sys_trace系统调用内核逻辑
+    /// 提取用户传入的mask参数，存储到当前进程的trace_mask
+    fn sys_trace(&mut self) -> Result<usize, ()> {
+        // 提取第0个参数（mask），arg_raw返回usize，转为u64
+        let mask = self.arg_raw(0) as u64;
+        // 将mask存储到当前进程的trace_mask
+        let pd = self.data.get_mut();
+        pd.trace_mask = mask;
+        // 系统调用成功返回0
+        Ok(0)
     }
 
     /// # 功能说明
@@ -637,11 +704,12 @@ impl Proc {
     /// 5. 设置子进程的内存大小 `sz` 与父进程一致。
     /// 6. 复制 TrapFrame（用户寄存器状态），并将子进程的返回值寄存器 `a0` 设为 0。
     /// 7. 克隆父进程的打开文件数组和当前工作目录。
-    /// 8. 复制父进程名称到子进程。
-    /// 9. 记录子进程的进程 ID（pid）。
-    /// 10. 设置子进程的父进程为当前进程。
-    /// 11. 将子进程状态置为 `RUNNABLE`，表示可调度。
-    /// 12. 返回子进程的进程 ID。
+    /// 8. 新增：复制父进程的trace_mask到子进程
+    /// 9. 复制父进程名称到子进程。
+    /// 10. 记录子进程的进程 ID（pid）。
+    /// 11. 设置子进程的父进程为当前进程。
+    /// 12. 将子进程状态置为 `RUNNABLE`，表示可调度。
+    /// 13. 返回子进程的进程 ID。
     ///
     /// # 参数
     /// - `&mut self`：当前进程的可变引用，用于访问自身私有数据和状态。
@@ -688,6 +756,9 @@ impl Proc {
         cdata.open_files.clone_from(&pdata.open_files);
         cdata.cwd.clone_from(&pdata.cwd);
         
+        // 新增：复制父进程的trace_mask到子进程
+        cdata.trace_mask = pdata.trace_mask;
+
         // copy process name
         cdata.name.copy_from_slice(&pdata.name);
 

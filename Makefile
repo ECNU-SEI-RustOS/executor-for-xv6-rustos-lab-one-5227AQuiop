@@ -100,6 +100,7 @@ print-gdbport:
 UPROGS=\
 	$(USER)/_cat\
 	$(USER)/_echo\
+	$(USER)/_trace\
 	$(USER)/_forktest\
 	$(USER)/_grep\
 	$(USER)/_init\
